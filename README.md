@@ -1,10 +1,11 @@
 ---
 pipeline_tag: multi-modal
-frameworks:
-  - PyTorch
-license: apache-2.0
 hardwares:
   - NPU
+  - Atlas 800I A2
+frameworks:
+  - PyTorch
+license: other
 language:
   - en
 ---
