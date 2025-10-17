@@ -81,15 +81,15 @@ pip install torch_npu-{pytorchversion}.xxxx.{arch}.whl
 HunyuanImage-3.0 模型权重链接：
 
 ```shell
-	https://huggingface.co/tencent/HunyuanImage-3.0
+https://huggingface.co/tencent/HunyuanImage-3.0
 ```
 ## 三、HunyuanImage-3.0 使用
 
 当前支持的卡数：1、2、4、8、16
 ### 3.1 下载到本地
 ```shell
-   git clone https://modelers.cn/MindIE/HunyuanImage-3.0.git
-   cd HunyuanImage-3.0
+git clone https://modelers.cn/MindIE/HunyuanImage-3.0.git
+cd HunyuanImage-3.0
 ```
 ### 3.2 单卡性能测试
 
