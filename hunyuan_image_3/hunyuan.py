@@ -11,6 +11,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
+import time
 import math
 import random
 import re
@@ -19,12 +21,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Union, Optional, Dict, Any, Tuple, Callable
 
 import torch
+import torch_npu
+
+from torch_npu.contrib import transfer_to_npu
+from mindiesd import attention_forward, rotary_position_embedding, RMSNorm
+
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from einops import rearrange
 from torch import Tensor
 from torch import nn
-from torch.cuda import nvtx
+
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, StaticCache
 from transformers.generation.logits_process import LogitsProcessorList
@@ -42,6 +49,8 @@ from transformers.utils import (
     is_flash_attn_2_available,
     logging,
 )
+
+from copy import deepcopy
 
 if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
@@ -1115,35 +1124,34 @@ class HunyuanMoE(nn.Module):
 
         reshaped_input = hidden_states.reshape(-1, hidden_size) # [bsz*seq_len, hidden_size]
 
-        with nvtx.range("MoE"):
-            if self._moe_impl == "flashinfer":
-                # Get expert weights
-                if not self._weights_initialized:
-                    self._initialize_weights_on_device(hidden_states.device)
-                topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
+        if self._moe_impl == "flashinfer":
+            # Get expert weights
+            if not self._weights_initialized:
+                self._initialize_weights_on_device(hidden_states.device)
+            topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
 
-                combined_output = torch.zeros_like(reshaped_input)
-                _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
-                    reshaped_input.contiguous(),
-                    topk_index.to(torch.int).contiguous(),
-                    topk_weight.to(torch.float).contiguous(),
-                    self.moe_weight,
-                    self.moe_weight_2,
-                    torch.bfloat16,
-                    output=combined_output,
-                    quant_scales=None,
-                )
-            else:
-                # Original implementation - fallback for compatibility
-                l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, topk_impl='default')
-                dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
-                chunks = dispatched_input.chunk(self.num_experts, dim=0)
-                expert_outputs = []
-                for chunk, expert in zip(chunks, self.experts):
-                    expert_outputs.append(expert(chunk))
+            combined_output = torch.zeros_like(reshaped_input)
+            _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
+                reshaped_input.contiguous(),
+                topk_index.to(torch.int).contiguous(),
+                topk_weight.to(torch.float).contiguous(),
+                self.moe_weight,
+                self.moe_weight_2,
+                torch.bfloat16,
+                output=combined_output,
+                quant_scales=None,
+            )
+        else:
+            # Original implementation - fallback for compatibility
+            l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, topk_impl='default')
+            dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
+            chunks = dispatched_input.chunk(self.num_experts, dim=0)
+            expert_outputs = []
+            for chunk, expert in zip(chunks, self.experts):
+                expert_outputs.append(expert(chunk))
 
-                expert_output = torch.cat(expert_outputs, dim=0)
-                combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
+            expert_output = torch.cat(expert_outputs, dim=0)
+            combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
 
         combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
 
@@ -1361,43 +1369,42 @@ class HunyuanImage3FlashAttention2(HunyuanImage3SDPAAttention):
 
         mode = kwargs.get("mode", "gen_text")
         # For gen_text and gen_image, we need to handle the attention differently
-        with nvtx.range("attention"):
-            if mode == "gen_text":
-                if attention_mask is None:
-                    attn_output = flash_attn_func(q_fa, k_fa, v_fa, causal=False)   # decode attention
-                else:
-                    attn_output = flash_attn_func(q_fa, k_fa, v_fa, causal=True)    # prefill attention
-            else:  # image attention
-                gen_timestep_scatter_index: Optional[torch.Tensor] = kwargs.get("gen_timestep_scatter_index", None)
-                assert gen_timestep_scatter_index is not None, \
-                    "When gen_image, `gen_timestep_scatter_index` must be provided."
-                # TODO: batchify
-                timestep_index = gen_timestep_scatter_index[0, 0].item()
-                # When image generation, different attention implementations for the first step and the following steps
-                # help to improve the inference speed.
-                first_step = kwargs.get("first_step", None)
-                if first_step is None:
-                    raise ValueError("When gen_image, `first_step` must be provided.")
-                if first_step:
-                    casual_len = timestep_index + 1
-                    text_query_states = q_fa[:, :casual_len, :, :]
-                    text_key_states = k_fa[:, :casual_len, :, :]
-                    text_value_states = v_fa[:, :casual_len, :, :]
-                    text_attn_output = flash_attn_func(
-                        text_query_states, text_key_states, text_value_states, causal=True)
-                    image_query_states = q_fa[:, casual_len:, :, :]
-                    image_attn_output = flash_attn_func(image_query_states, k_fa, v_fa, causal=False)
-                    attn_output = torch.cat((text_attn_output, image_attn_output), dim=1)
-                else:
-                    casual_len = timestep_index + 1
-                    timestep_query_states = q_fa[:, 0:1, :, :]
-                    timestep_key_states = k_fa[:, :casual_len, :, :]
-                    timestep_value_states = v_fa[:, :casual_len, :, :]
-                    timestep_attn_output = flash_attn_func(
-                        timestep_query_states, timestep_key_states, timestep_value_states, causal=True)
-                    image_query_states = q_fa[:, 1:, :, :]
-                    image_attn_output = flash_attn_func(image_query_states, k_fa, v_fa, causal=False)
-                    attn_output = torch.cat((timestep_attn_output, image_attn_output), dim=1)
+        if mode == "gen_text":
+            if attention_mask is None:
+                attn_output = flash_attn_func(q_fa, k_fa, v_fa, causal=False)   # decode attention
+            else:
+                attn_output = flash_attn_func(q_fa, k_fa, v_fa, causal=True)    # prefill attention
+        else:  # image attention
+            gen_timestep_scatter_index: Optional[torch.Tensor] = kwargs.get("gen_timestep_scatter_index", None)
+            assert gen_timestep_scatter_index is not None, \
+                "When gen_image, `gen_timestep_scatter_index` must be provided."
+            # TODO: batchify
+            timestep_index = gen_timestep_scatter_index[0, 0].item()
+            # When image generation, different attention implementations for the first step and the following steps
+            # help to improve the inference speed.
+            first_step = kwargs.get("first_step", None)
+            if first_step is None:
+                raise ValueError("When gen_image, `first_step` must be provided.")
+            if first_step:
+                casual_len = timestep_index + 1
+                text_query_states = q_fa[:, :casual_len, :, :]
+                text_key_states = k_fa[:, :casual_len, :, :]
+                text_value_states = v_fa[:, :casual_len, :, :]
+                text_attn_output = flash_attn_func(
+                    text_query_states, text_key_states, text_value_states, causal=True)
+                image_query_states = q_fa[:, casual_len:, :, :]
+                image_attn_output = flash_attn_func(image_query_states, k_fa, v_fa, causal=False)
+                attn_output = torch.cat((text_attn_output, image_attn_output), dim=1)
+            else:
+                casual_len = timestep_index + 1
+                timestep_query_states = q_fa[:, 0:1, :, :]
+                timestep_key_states = k_fa[:, :casual_len, :, :]
+                timestep_value_states = v_fa[:, :casual_len, :, :]
+                timestep_attn_output = flash_attn_func(
+                    timestep_query_states, timestep_key_states, timestep_value_states, causal=True)
+                image_query_states = q_fa[:, 1:, :, :]
+                image_attn_output = flash_attn_func(image_query_states, k_fa, v_fa, causal=False)
+                attn_output = torch.cat((timestep_attn_output, image_attn_output), dim=1)
 
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
@@ -2323,8 +2330,15 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             max_cache_len = output.tokens.shape[1]
         else:
             max_cache_len = output.tokens.shape[1] + default(max_new_tokens, self.generation_config.max_length)
+        if int(os.getenv("WORLD_SIZE", 8)) > 1:
+            cache_config = deepcopy(self.config)
+            cache_config.num_attention_heads = self.config.num_attention_heads // int(os.getenv("WORLD_SIZE", 8))
+            cache_config.num_key_value_heads = self.config.num_key_value_heads // int(os.getenv("WORLD_SIZE", 8))
+        else:
+            cache_config = self.config
         cache = HunyuanStaticCache(
             config=self.config,
+            # config=cache_config,
             batch_size=batch_size * cfg_factor[mode],
             max_cache_len=max_cache_len,
             dtype=torch.bfloat16,
