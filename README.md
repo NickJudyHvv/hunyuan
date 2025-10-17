@@ -1,5 +1,5 @@
 ---
-pipeline_tag: MultiModal
+pipeline_tag: multi-modal
 frameworks:
   - PyTorch
 license: apache-2.0
