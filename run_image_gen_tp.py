@@ -19,7 +19,7 @@ import torch.distributed as dist
 
 import os
 from pathlib import Path
-from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
+from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM, HunyuanImage3DecoderLayer
 import time
 
 def parse_args():
@@ -249,7 +249,7 @@ def main(args):
     kwargs = dict(
         attn_implementation=args.attn_impl,
         torch_dtype="auto",
-        device_map="auto",
+        device_map="cpu",
         moe_impl=args.moe_impl,
     )
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
