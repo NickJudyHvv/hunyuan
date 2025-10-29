@@ -5,7 +5,7 @@ export TOKENIZERS_PARALLELISM=false
 
 export ASCEND_LAUNCH_BLOCKING=1
 
-python   run_image_gen_tp.py \
+python   run_image_gen.py \
          --model-id /data/weights/HunyuanImage-3.0 \
          --verbose 1 \
          --sys-deepseek-prompt "universal" \
