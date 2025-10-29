@@ -97,12 +97,12 @@ def main(args):
         attn_implementation=args.attn_impl,
         torch_dtype="auto",
         device_map="auto",
-        max_memory=max_mem,
+        # max_memory=max_mem,
         moe_impl=args.moe_impl,
     )
     init_double_stream(double_stream=True)
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
-    model = fused_grouped_matmul_swiglu_ep(model)
+    model = fuse_grouped_matmul_swiglu_ep(model)
     model.load_tokenizer(args.model_id)
 
     # Rewrite prompt with DeepSeek

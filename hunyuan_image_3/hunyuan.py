@@ -1100,7 +1100,7 @@ class HunyuanTopKGate(nn.Module):
                 expert_gate, expert_index = torch.topk(gates, topk)
                 expert_mask = F.one_hot(expert_index, num_classes=self.num_experts)
                 gate_s = torch.clamp(
-                    torch.matmul(expert_mask.float(), gates.unsqueeze(-1).sum(dim=1), min=torch.finfo(gates.dtype).eps
+                    torch.matmul(expert_mask.float(), gates.unsqueeze(-1)).sum(dim=1), min=torch.finfo(gates.dtype).eps
                 )
                 topk_weight = topk_weight / gate_s
         elif topk_impl == 'easy':
@@ -1157,8 +1157,7 @@ class GroupedMatMulSwiGLU(nn.Module):
             down_weights.append(expert.down_proj.weight)
         self.gate_up_weights.copy_(torch.stack(gate_up_weights, dim=0).transpose(1, 2).contiguous())
         self.down_weights.copy_(torch.stack(down_weights, dim=0).transpose(1, 2).contiguous())
-        self.gate_up_weights = self.gate_up_weights.to(self.device)
-        self.down_weights = self.down_weights.to(self.device)
+
     
     def forward(
         self, 
@@ -1166,6 +1165,8 @@ class GroupedMatMulSwiGLU(nn.Module):
         tokens_per_expert,
         group_list_type,
     ):
+        self.gate_up_weights = self.gate_up_weights.to(self.device)
+        self.down_weights = self.down_weights.to(self.device)
         gate_up_out = torch_npu.npu_grouped_matmul(
             x=[expanded_x],
             weight=[self.gate_up_weights],
@@ -1252,7 +1253,7 @@ class HunyuanMoE(nn.Module):
             token_per_expert = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, self.num_experts).to(torch.int64)
 
             # grouped matmul swiglu
-            down_out = self.experts(expanded_x, token_per_expert, group_list_type=0, device=hidden_states.device)
+            down_out = self.experts(expanded_x, token_per_expert, group_list_type=0)
             
             DOUBLE_STREAM, NEW_STREAM, CURRENT_EVENT, NEW_EVENT = get_double_stream()
             if DOUBLE_STREAM:
