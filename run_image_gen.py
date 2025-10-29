@@ -17,7 +17,7 @@ import torch_npu
 
 import os
 from pathlib import Path
-from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
+from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM, fuse_grouped_matmul_swiglu_ep, init_double_stream
 
 
 def parse_args():
@@ -100,7 +100,9 @@ def main(args):
         max_memory=max_mem,
         moe_impl=args.moe_impl,
     )
+    init_double_stream(double_stream=True)
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
+    model = fused_grouped_matmul_swiglu_ep(model)
     model.load_tokenizer(args.model_id)
 
     # Rewrite prompt with DeepSeek

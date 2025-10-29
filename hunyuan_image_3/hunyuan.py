@@ -52,6 +52,23 @@ from transformers.utils import (
 
 from copy import deepcopy
 
+DOUBLE_STREAM = False
+NEW_STREAM = False
+CURRENT_EVENT = None
+NEW_EVENT = None
+
+def init_double_stream(double_stream):
+    if double_stream:
+        global DOUBLE_STREAM, NEW_STREAM, CURRENT_EVENT, NEW_EVENT, CURRENT_STREAM
+        DOUBLE_STREAM = True
+        NEW_STREAM = torch.npu.Stream()
+        CURRENT_EVENT = torch.npu.Event()
+        NEW_EVENT = torch.npu.Event()
+        CURRENT_STREAM = torch.npu.Stream()
+
+def get_double_stream():
+    return DOUBLE_STREAM, NEW_STREAM, CURRENT_EVENT, NEW_EVENT
+
 if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
 
@@ -135,6 +152,20 @@ def real_batched_index_select(t, dim, idx):
     assert len(t) == len(idx), f"{len(t)=} != {len(idx)=}"
     return torch.stack([torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))])
 
+@torch.no_grad()
+def fuse_grouped_matmul_swiglu_ep(model):
+    for _, module in model.named_modules():
+        if isinstance(module, HunyuanMoE):
+            new_experts = GroupedMatMulSwiGLU(
+                config=module.config,
+                num_experts=module.num_experts,
+                dtype=next(module.parameters()).dtype,
+                device=next(module.parameters()).device,
+            )
+            new_experts.init_weights(module.experts)
+            setattr(module, "experts", new_experts)
+    
+    return model
 
 # =======================================================
 #     Module Functions
@@ -1044,8 +1075,8 @@ class HunyuanTopKGate(nn.Module):
         self.drop_tokens = config.moe_drop_tokens
         self.min_capacity = 8
         self.random_routing_dropped_token = config.moe_random_routing_dropped_token
-        num_experts = config.num_experts if isinstance(config.num_experts, int) else config.num_experts[layer_idx]
-        self.wg = nn.Linear(config.hidden_size, num_experts, bias=False, dtype=torch.float32)
+        self.num_experts = config.num_experts if isinstance(config.num_experts, int) else config.num_experts[layer_idx]
+        self.wg = nn.Linear(config.hidden_size, self.num_experts, bias=False, dtype=torch.float32)
 
         # DeepSeek gating args
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -1061,18 +1092,23 @@ class HunyuanTopKGate(nn.Module):
             hidden_states = hidden_states.float()
         logits = self.wg(hidden_states)
         if topk_impl == 'default':
-            gate_output = topkgating(logits, self.moe_topk, group_limited_greedy=self.group_limited_greedy,
-                                     n_group=self.n_group, topk_group=self.topk_group,
-                                     norm_topk_prob=self.norm_topk_prob,
-                                     routed_scaling_factor=self.routed_scaling_factor,
-                                     capacity_factor=self.config.capacity_factor,
-                                     drop_tokens=self.drop_tokens)
+            topk_weight, topk_index, row_idx = torch_npu.npu_moe_gating_top_k_softmax(logits, k=self.moe_topk)
+
+            topk = self.config.moe_topk[self.layer_idx]
+            if topk > 1:
+                gates = F.softmax(logits, dim=1)
+                expert_gate, expert_index = torch.topk(gates, topk)
+                expert_mask = F.one_hot(expert_index, num_classes=self.num_experts)
+                gate_s = torch.clamp(
+                    torch.matmul(expert_mask.float(), gates.unsqueeze(-1).sum(dim=1), min=torch.finfo(gates.dtype).eps
+                )
+                topk_weight = topk_weight / gate_s
         elif topk_impl == 'easy':
             gate_output = self.easy_topk(logits, self.moe_topk)
         else:
             raise ValueError(f"Unsupported topk_impl: {topk_impl}")
 
-        return gate_output
+        return topk_weight, topk_index, row_idx
 
     @staticmethod
     def easy_topk(logits, moe_topk):
@@ -1084,6 +1120,73 @@ class HunyuanTopKGate(nn.Module):
 
         return topk_weight, expert_index
 
+class GroupedMatMulSwiGLU(nn.Module):
+    def __init__(
+        self,
+        config: HunyuanImage3Config,
+        num_experts: int,
+        dtype: torch.dtype = torch.bfloat16,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.hidden_act = config.hidden_act
+        self.intermediate_size = config.intermediate_size * 2
+        self.num_experts = num_experts
+        self.dtype = dtype
+
+        self.register_buffer(
+            "gate_up_weights",
+            torch.empty((self.num_experts, self.hidden_size, self.intermediate_size), dtype=dtype),
+            persistent=True
+        )
+        self.register_buffer(
+            "down_weights",
+            torch.empty((self.num_experts, self.intermediate_size // 2, self.hidden_size), dtype=dtype),
+            persistent=True
+        )
+        self.device = device
+    
+    def init_weights(self, experts: nn.ModuleList):
+        gate_up_weights = []
+        down_weights = []
+        for i, expert in enumerate(experts):
+            w1, w2 = expert.gate_and_up_proj.weight.chunk(2, dim=0)
+            gate_up_weights.append(torch.cat([w2, w1], dim=0))
+            down_weights.append(expert.down_proj.weight)
+        self.gate_up_weights.copy_(torch.stack(gate_up_weights, dim=0).transpose(1, 2).contiguous())
+        self.down_weights.copy_(torch.stack(down_weights, dim=0).transpose(1, 2).contiguous())
+        self.gate_up_weights = self.gate_up_weights.to(self.device)
+        self.down_weights = self.down_weights.to(self.device)
+    
+    def forward(
+        self, 
+        expanded_x,
+        tokens_per_expert,
+        group_list_type,
+    ):
+        gate_up_out = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[self.gate_up_weights],
+            group_list_type=group_list_type,
+            group_list=tokens_per_expert,
+            group_type=0,
+            split_item=2
+        )[0]
+
+        swiglu_out = torch_npu.npu_swiglu(gate_up_out, dim=-1)
+
+        down_out = torch_npu.npu_grouped_matmul(
+            x=[swiglu_out],
+            weight=[self.down_weights],
+            group_list_type=group_list_type,
+            group_list=tokens_per_expert,
+            group_type=0,
+            split_item=2
+        )[0]
+
+        return down_out
 
 class HunyuanMoE(nn.Module):
     def __init__(self, config: HunyuanImage3Config, layer_idx: Optional[int] = None):
@@ -1142,16 +1245,32 @@ class HunyuanMoE(nn.Module):
                 quant_scales=None,
             )
         else:
-            # Original implementation - fallback for compatibility
-            l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, topk_impl='default')
-            dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
-            chunks = dispatched_input.chunk(self.num_experts, dim=0)
-            expert_outputs = []
-            for chunk, expert in zip(chunks, self.experts):
-                expert_outputs.append(expert(chunk))
+            topk_weight, topk_index, row_idx = self.gate(hidden_states, topk_impl='default')
 
-            expert_output = torch.cat(expert_outputs, dim=0)
-            combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
+            expanded_x, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(reshaped_input, row_idx, topk_index, active_num=reshaped_input.shape[0])
+
+            token_per_expert = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, self.num_experts).to(torch.int64)
+
+            # grouped matmul swiglu
+            down_out = self.experts(expanded_x, token_per_expert, group_list_type=0, device=hidden_states.device)
+            
+            DOUBLE_STREAM, NEW_STREAM, CURRENT_EVENT, NEW_EVENT = get_double_stream()
+            if DOUBLE_STREAM:
+                with torch.npu.stream(CURRENT_STREAM):
+                    CURRENT_EVENT.record()
+                with torch.npu.stream(NEW_STREAM):
+                    CURRENT_EVENT.wait()
+                    combined_output = torch_npu.npu_moe_finalize_routing(
+                        down_out,
+                        skip1=None,
+                        skip2=None,
+                        bias=None,
+                        scales=topk_weight,
+                        expanded_src_to_dst_row=expanded_row_idx,
+                        export_for_source_row=topk_index,
+                    )
+                    NEW_EVENT.record(NEW_STREAM)
+                NEW_EVENT.wait()
 
         combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
 
@@ -1218,8 +1337,8 @@ class HunyuanImage3SDPAAttention(nn.Module):
         self.o_proj = nn.Linear(self.hidden_size_q, self.hidden_size, bias=config.attention_bias)
 
         if self.use_qk_norm:
-            self.query_layernorm = HunyuanRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = HunyuanRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.query_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.key_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         if self.use_rotary_pos_emb:
             self._init_rope()
@@ -1265,7 +1384,12 @@ class HunyuanImage3SDPAAttention(nn.Module):
 
         if self.use_rotary_pos_emb:
             cos, sin = custom_pos_emb
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if cos.squeeze().dim() == 2:
+                query_states = rotary_position_embedding(query_states, cos.squeeze(), sin.squeeze(), head_first=True)
+                key_states = rotary_position_embedding(key_states, cos.squeeze(), sin.squeeze(), head_first=True)
+            else:
+                query_states = rotary_position_embedding(query_states, cos.squeeze()[0], sin.squeeze()[0], head_first=True)
+                key_states = rotary_position_embedding(key_states, cos.squeeze()[0], sin.squeeze()[0], head_first=True)
 
         if self.use_qk_norm:
             query_states = self.query_layernorm(query_states)
@@ -1439,8 +1563,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
         else:
             self.mlp = HunyuanMLP(config, layer_idx=layer_idx, is_shared_mlp=False, is_moe=False)
         if config.norm_type == 'hf_rms' or config.norm_type == 'rms':
-            self.input_layernorm = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         elif config.norm_type == 'fused' or config.norm_type == 'torch_nn':
             self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1627,7 +1751,7 @@ class HunyuanImage3Model(HunyuanImage3PreTrainedModel):
             [HunyuanImage3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         if not config.add_classification_head:
-            self.ln_f = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.ln_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Initialize weights and apply final processing
         self.post_init()
