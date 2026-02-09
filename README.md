@@ -11,8 +11,10 @@ language:
 ---
 
 ## 注意
-- 本模型仓代码，是针对此开源链接进行的适配
+- 本模型仓代码，是针对此开源链接于 0930 开源的版本进行的适配
 https://github.com/Tencent-Hunyuan/HunyuanImage-3.0
+
+该模型后续支持的 vllm 版本和 Instruct 版本权重不在此仓库支持范围内
 
 ## 一、准备运行环境
 
