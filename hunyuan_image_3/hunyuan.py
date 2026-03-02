@@ -92,6 +92,12 @@ logger = logging.get_logger(__name__)
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func
 
+ALGO = int(os.getenv('ALGO', 0))
+FA_QUANT = None
+if ALGO == 2:
+    from hunyuan_image_3.utils.flash_attn_fp8 import FP8RotateQuantFA
+    FA_QUANT = FP8RotateQuantFA()
+
 # Type aliases
 BatchRaggedImages = Union[torch.Tensor, List[Union[torch.Tensor, List[torch.Tensor]]]]
 BatchRaggedTensor = Union[torch.Tensor, List[torch.Tensor]]
@@ -1415,9 +1421,16 @@ class HunyuanImage3SDPAAttention(nn.Module):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0
-        )
+        if attention_mask is not None:
+            print(f"[SDPA Attention] attention_mask is not None, shape={attention_mask.shape}")
+        else:
+            print(f"[SDPA Attention] attention_mask is None")
+        if ALGO == 2:
+            attn_output = FA_QUANT(query_states, key_states, value_states, layout="BNSD")
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0
+            )
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(bsz, q_len, -1)

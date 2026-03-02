@@ -5,6 +5,9 @@ export TOKENIZERS_PARALLELISM=false
 
 export ASCEND_LAUNCH_BLOCKING=1
 
+export ALGO=2 # 0-SDPA，1-FA，2-FAOnlineFP8Quant
+export ENABLE_ONLINE_FP8_QUANT=1 # 是否开启MM的在线FP8量化
+
 python   run_image_gen.py \
          --model-id /data/weights/HunyuanImage-3.0 \
          --verbose 1 \

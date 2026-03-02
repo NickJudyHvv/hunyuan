@@ -103,6 +103,12 @@ def main(args):
     init_double_stream(double_stream=True)
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
     model = fuse_grouped_matmul_swiglu_ep(model)
+
+    from hunyuan_image_3.utils.patch_linear_with_fp8 import patch_linear_with_fp8
+    if int(os.getenv("ENABLE_ONLINE_FP8_QUANT", 0)):
+        patcher = patch_linear_with_fp8()
+        patcher.register_model(model.model)
+
     model.load_tokenizer(args.model_id)
 
     # Rewrite prompt with DeepSeek
